@@ -7,10 +7,10 @@ setup(
     author='Tianyi Hao',
     url='https://github.com/haoty/QVoice',
     packages=find_packages(exclude=['test*', 'scripts', 'assets', 'notebooks', 'doc']),
-    python_requires='>=3.10',
+    python_requires='>=3.8.13',
     install_requires=[
         'numpy>=1.22.4',
-        'qiskit>=0.37.1',
+        'qiskit>=0.39.0',
         'qiskit_finance>=0.3.3',
         'qiskit_optimization>=0.4.0',
         'networkx>=2.8.4',

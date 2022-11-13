@@ -1,16 +1,18 @@
-from typing import Callable, Iterable, List, Optional, Union, Dict
-import numpy as np
+from typing import Callable, Dict, Iterable, List, Optional, Union
+
 import matplotlib.pyplot as plt
-from qiskit.algorithms import VQE, NumPyMinimumEigensolver, QAOA
-from qiskit.algorithms.optimizers import OptimizerResult, COBYLA
-from qiskit.circuit.library import QAOAAnsatz
-from qiskit.opflow import OperatorBase, StateFn, ExpectationFactory
+import numpy as np
+from qiskit import QuantumCircuit
+from qiskit.algorithms import QAOA, VQE, NumPyMinimumEigensolver
+from qiskit.algorithms.optimizers import OptimizerResult, SciPyOptimizer
+from qiskit.opflow import AerPauliExpectation, ExpectationFactory, StateFn
 from qiskit_optimization import QuadraticProgram
-from qiskit_optimization.converters import QuadraticProgramToQubo
 from qiskit_optimization.algorithms import MinimumEigenOptimizer
+from qiskit_optimization.converters import QuadraticProgramToQubo
+from scipy.optimize import NonlinearConstraint
 
 
-class InConstraintOptimizer:
+class InConstraintSolver:
     def __init__(
         self,
         algorithm: VQE,
@@ -43,27 +45,35 @@ class InConstraintOptimizer:
         self.parameters = None
         self.in_cons_prob = None
 
-        if in_cons_prob_lbound and isinstance(self.optimizer, COBYLA):
-            self.optimizer._kwargs |= {
-                "constraints": {
-                    "type": "ineq",
-                    "fun": lambda x: self.get_in_cons_prob(x) - in_cons_prob_lbound,
+        if in_cons_prob_lbound and isinstance(self.optimizer, SciPyOptimizer):
+            self.optimizer._kwargs.update(
+                {
+                    "constraints": [
+                        {
+                            "type": "ineq",
+                            "fun": self.get_in_cons_prob,
+                        },
+                        # NonlinearConstraint(
+                        #     self.get_in_cons_prob, in_cons_prob_lbound, 1.0
+                        # ),
+                    ]
                 }
-            }
+            )
 
         self.iter = 0
         self.n = len(problem.variables)
         self.log_level = log_level
-
         self.log = {}
+        self.optimal_solution = None
+
         if log_level > 0:
             self.log = {"energy": []}
 
         if log_level > 1:
-            self.log |= {"in_cons_prob": []}
+            self.log.update({"in_cons_prob": []})
 
         if log_level > 2:
-            self.log |= {"opt_sol_prob": [], "approx_ratio": []}
+            self.log.update({"opt_sol_prob": [], "approx_ratio": []})
 
             self.optimal_solution = "".join(
                 [
@@ -74,11 +84,14 @@ class InConstraintOptimizer:
                 ]
             )
             print("Optimal Solution: ", self.optimal_solution)
-            print("Optimal Solution: ", MinimumEigenOptimizer(NumPyMinimumEigensolver(), 0).solve(problem).x)
             self.max_fval, self.min_fval, cum_fval = -np.inf, np.inf, 0
 
+        self.feasible_solns, self.feasible_indices, self.objective_values = (
+            [],
+            [],
+            {},
+        )
         if log_level > 2 or use_in_cons_energy or in_cons_prob_lbound:
-            self.feasible_solns, self.feasible_indices = [], []
 
             for i in range(2**self.n):
                 bitstr = format(i, f"0{self.n}b")[::-1]
@@ -91,6 +104,7 @@ class InConstraintOptimizer:
                         self.max_fval = max(fval, self.max_fval)
                         self.min_fval = min(fval, self.min_fval)
                         cum_fval += fval
+                        self.objective_values[bitstr] = fval
 
             if log_level > 2:
                 self.approx_ratio_baseline = (
@@ -107,27 +121,34 @@ class InConstraintOptimizer:
             .compose(StateFn(self.get_state(parameters)))
             .reduce()
         )
-
-        # parameter_sets = np.reshape(parameters, (-1, len(parameters)))
-        # # Create dict associating each parameter with the lists of parameterization values for it
-        # param_bindings = dict(
-        #     zip(self.algorithm.ansatz.parameters, parameter_sets.transpose().tolist())
-        # )
-        # sampled_expect_op = self.algorithm._circuit_sampler.convert(
-        #     expect_op, params=param_bindings
-        # )
+        if not self.use_in_cons_energy and isinstance(
+            self.expectation, AerPauliExpectation
+        ):
+            expect_op = self.algorithm._circuit_sampler.convert(expect_op)
         energy = np.real(expect_op.eval())
         if self.log_level > 0:
             self.log["energy"].append(energy)
         return energy
 
-    def get_state(self, parameters: np.ndarray) -> Union[List[float], Dict[str, int]]:
-        if self.parameters is not None and np.allclose(self.parameters, parameters):
+    def get_state(
+        self, parameters: np.ndarray
+    ) -> Union[List[float], Dict[str, int], QuantumCircuit]:
+        if self.parameters is not None and np.allclose(
+            self.parameters, parameters, rtol=0, atol=1e-13
+        ):
             return self.state
 
         self.parameters = parameters
         self.iter += 1
-        # state = self.algorithm._get_eigenstate(parameters)
+        if isinstance(self.expectation, AerPauliExpectation):
+            circuit = self.algorithm.ansatz.bind_parameters(parameters)
+            if (
+                not self.use_in_cons_energy
+                and not self.in_cons_prob_lbound
+                and self.log_level < 3
+            ):
+                self.state = circuit
+                return circuit
 
         state_fn = self.algorithm._circuit_sampler.convert(
             StateFn(self.algorithm.ansatz.bind_parameters(parameters))
@@ -140,7 +161,7 @@ class InConstraintOptimizer:
         if (
             not self.use_in_cons_energy
             and not self.in_cons_prob_lbound
-            and self.log_level < 2
+            and self.log_level < 3
         ):
             self.state = state
             return state
@@ -156,47 +177,69 @@ class InConstraintOptimizer:
                 state_squared = np.abs(state * state.conj())
                 for idx, bitstr in zip(self.feasible_indices, self.feasible_solns):
                     prob = state_squared[idx]
-                    fval += prob * self.problem.objective.evaluate(
-                        [int(x) for x in bitstr]
-                    )
+                    if bitstr not in self.objective_values.keys():
+                        self.objective_values[bitstr] = self.problem.objective.evaluate(
+                            [int(x) for x in bitstr]
+                        )
+                    fval += prob * self.objective_values[bitstr]
                     if bitstr == self.optimal_solution:
                         opt_sol_prob = prob
-        else:  # TODO
-            raise NotImplementedError("qasm simulator not yet supported")
-            # for idx, amplitude in state.items():
-            #     prob = amplitude**2
-            #     if idx in self.feasible_solns:
-            #         in_cons_prob += prob
-            #         if idx[::-1] == self.optimal_solution:
-            #             opt_sol_prob = prob
+        else:
+            in_cons_state = {}
+            for bitstr, amplitude in state.items():
+                prob = amplitude**2
+                bitstr = bitstr[::-1]
+                if bitstr in self.feasible_solns:
+                    in_cons_prob += prob
+                    in_cons_state[bitstr[::-1]] = amplitude
+                    if bitstr not in self.objective_values.keys():
+                        self.objective_values[bitstr] = self.problem.objective.evaluate(
+                            [int(x) for x in bitstr]
+                        )
+                    fval += prob * self.objective_values[bitstr]
+                    if bitstr == self.optimal_solution:
+                        opt_sol_prob = prob
+            in_cons_state = {
+                bitstr: amplitude / (in_cons_prob**0.5)
+                for bitstr, amplitude in in_cons_state.items()
+            }
 
         self.in_cons_prob = in_cons_prob
         if self.log_level > 1:
             self.log["in_cons_prob"].append(in_cons_prob)
 
         if self.log_level > 2:
-            approx_ratio = (fval / in_cons_prob - self.max_fval) / (
-                self.min_fval - self.max_fval
+            sense = self.problem.objective.sense.value
+            approx_ratio = (
+                sense
+                * (
+                    fval / in_cons_prob
+                    - (self.max_fval if sense == 1 else self.min_fval)
+                )
+                / (self.min_fval - self.max_fval)
             )
             self.log["approx_ratio"].append(approx_ratio)
             self.log["opt_sol_prob"].append(opt_sol_prob)
-            print(
-                f"{in_cons_prob = }  {opt_sol_prob = }  {approx_ratio = }  {opt_sol_prob / in_cons_prob}"
-            )
 
-        self.state = in_cons_state
-        return in_cons_state if self.use_in_cons_energy else state
+        self.state = (
+            in_cons_state
+            if self.use_in_cons_energy
+            else (
+                circuit if isinstance(self.expectation, AerPauliExpectation) else state
+            )
+        )
+        return self.state
 
     def get_in_cons_prob(self, parameters: np.ndarray) -> float:
         self.get_state(parameters)
-        return self.in_cons_prob
+        return self.in_cons_prob - self.in_cons_prob_lbound
 
     def minimize(
         self,
         fun: Callable,
         x0: np.ndarray,
-        jac: Callable | None = None,
-        bounds: list | None = None,
+        jac: Optional[Callable] = None,
+        bounds: Optional[list] = None,
     ) -> OptimizerResult:
 
         if callable(self.optimizer):
@@ -221,6 +264,11 @@ class InConstraintOptimizer:
                     v = (np.array(v) - min(v)) / (max(v) - min(v))
                     k = "energy (normalized)"
                 plt.plot(range(len(v)), v, label=f"{k}")
+        plt.axhline(
+            self.in_cons_prob_lbound,
+            label="lower bound on in-cons prob",
+            linestyle="--",
+        )
         plt.xlabel("Iteration", fontsize=16)
         plt.xticks(fontsize=16)
         plt.yticks(fontsize=16)
@@ -237,7 +285,7 @@ class InConstraintOptimizer:
         filename: Optional[str] = None,
     ) -> None:
         if not isinstance(self.algorithm, QAOA):
-            raise NotImplementedError("Currently only supports QAOAAnsatz")
+            raise NotImplementedError("Grid search is only supported for QAOA")
         reps = self.algorithm._reps
         # opt_beta, opt_gamma = 0, 0
         # opt_obj = np.inf
@@ -255,33 +303,57 @@ class InConstraintOptimizer:
                 StateFn(self.algorithm.ansatz.bind_parameters(params))
             ).eval()
             in_cons_prob, fval = 0, 0
-            state = state_fn.primitive.data
-            state = np.abs(state * state.conj())
-            for i in self.feasible_indices:
-                prob = state[i]
-                in_cons_prob += prob
-                fval += prob * self.problem.objective.evaluate(
-                    [int(x) for x in format(i, f"0{self.n}b")[::-1]]
+            if self.algorithm.quantum_instance.is_statevector:
+                state = state_fn.primitive.data
+                in_cons_state = np.zeros(len(state), dtype=complex)
+                in_cons_state[self.feasible_indices] = state[self.feasible_indices]
+                in_cons_prob = np.sum(np.abs(in_cons_state * in_cons_state.conj()))
+                in_cons_state = in_cons_state / (in_cons_prob**0.5)
+                state_squared = np.abs(state * state.conj())
+                for idx, bitstr in zip(self.feasible_indices, self.feasible_solns):
+                    prob = state_squared[idx]
+                    if bitstr not in self.objective_values.keys():
+                        self.objective_values[bitstr] = self.problem.objective.evaluate(
+                            [int(x) for x in bitstr]
+                        )
+                    fval += prob * self.objective_values[bitstr]
+            else:
+                state = state_fn.to_dict_fn().primitive
+                for bitstr, amplitude in state.items():
+                    prob = amplitude**2
+                    bitstr = bitstr[::-1]
+                    if bitstr in self.feasible_solns:
+                        in_cons_prob += prob
+                        in_cons_state[bitstr[::-1]] = amplitude
+                        if bitstr not in self.objective_values.keys():
+                            self.objective_values[bitstr] = self.problem.objective.evaluate(
+                                [int(x) for x in bitstr]
+                            )
+                        fval += prob * self.objective_values[bitstr]
+
+            sense = self.problem.objective.sense.value
+            approx_ratio = (
+                sense
+                * (
+                    fval / in_cons_prob
+                    - (self.max_fval if sense == 1 else self.min_fval)
                 )
-            approx_ratios.append(
-                (fval / in_cons_prob - self.min_fval) / (self.max_fval - self.min_fval)
+                / (self.min_fval - self.max_fval)
             )
             in_cons_probs.append(in_cons_prob)
-            # if np.allclose(in_cons_prob, len(feasible_indices) / 2**n):
-            #     print(f"beta/pi: {beta / np.pi}, gamma/2pi: {gamma / np.pi / 2}, approx_ratio: {approx_ratios[-1]}")
+            approx_ratios.append(approx_ratio)
         self.grid_search = {
             "approx_ratio": approx_ratios,
-            "in_cons_prob": in_cons_probs
+            "in_cons_prob": in_cons_probs,
         }
         plt.figure()
         plt.scatter(in_cons_probs, approx_ratios, s=1, label="grid search")
-        # plt.scatter(in_cons_probs, 2 * approx_ratio_baseline - approx_ratios, s=1)
         plt.axhline(
             y=self.approx_ratio_baseline,
             color="g",
             linestyle="-",
             linewidth=1,
-            label="uniformly random feasible states",
+            label="random feasible state",
         )
         if self.in_cons_prob_lbound is not None:
             plt.axvline(
@@ -289,7 +361,7 @@ class InConstraintOptimizer:
                 color="c",
                 linestyle="-",
                 linewidth=1,
-                label="in-constraint lower bound"
+                label="in-constraint prob. lower bound",
             )
         if self.log_level > 2:
             plt.scatter(
@@ -297,9 +369,10 @@ class InConstraintOptimizer:
                 self.log["approx_ratio"],
                 marker="x",
                 alpha=0.75,
-                label="optimizer",
+                label="optimizer trace",
                 c=range(len(self.log["in_cons_prob"])),
-                cmap='autumn'
+                cmap="autumn",
+                s=200,
             )
         plt.xlabel("In-constraint probability", fontsize=16)
         plt.ylabel("Approximation ratio", fontsize=16)
@@ -307,5 +380,6 @@ class InConstraintOptimizer:
         plt.yticks(fontsize=16)
         plt.legend(fontsize=16)
         plt.tight_layout()
+        plt.show()
         if filename is not None:
             plt.savefig(filename)
