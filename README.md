@@ -1,4 +1,5 @@
 # QVoice: Quantum Variational Optimization with In-Constraint Probability
+This is a package accompanying the paper [Exploiting In-Constraint Energy in Constrained Variational Quantum Optimization](https://arxiv.org/abs/2211.07016). QVoice runs variational quantum algorithms with in-constraint energy, an alternative objective for constrained problems, to achieve higher accuracies and lower numbers of iterations in comparison to using energy (exepectation value of the Hamiltonian) as the objective.
 
 ## Installation
 ```bash
@@ -20,7 +21,7 @@ result = qvoice.InConstraintSolver(algorithm, problem).solve()
 ```
 
 ### Walkthrough of functionalities provided by `InConstraintSolver`
-__The following walkthrough is also available in the format of [Jupyter notebook](https://github.com/HaoTy/QVoice/blob/main/notebooks/in_constraint_solver_usage.ipynb) and [Python script](https://github.com/HaoTy/QVoice/blob/main/notebooks/in_constraint_solver_usage.py).__
+__The following walkthrough is also available in the format of [Jupyter notebook](https://github.com/HaoTy/QVoice/blob/main/notebooks/in_constraint_solver_usage.ipynb) and [Python script](https://github.com/HaoTy/QVoice/blob/main/scripts/in_constraint_solver_usage.py).__
 
 First, set the number of variables/qubits and the seed for generating the problem
 
